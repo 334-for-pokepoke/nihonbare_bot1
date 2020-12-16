@@ -25,8 +25,8 @@ config = configparser.ConfigParser()
 if not os.path.exists(CONFIG_PATH):
     raise FileNotFoundError
 config.read(CONFIG_PATH, encoding='utf-8')
-channel_id = config.items('CHANNEL')
-role_id    = config.items('ROLE')
+channel_id = dict(config.items('CHANNEL'))
+role_id    = dict(config.items('ROLE'))
 
 def get_path(name):
     return MAINPATH + config.get('DIR', name)
@@ -163,7 +163,7 @@ class __Roles(commands.Cog, name = '役職の管理'):
 
     def select_roll(self, role):
         if role == 'slave' or role == 'call':
-            return int(channel_id[role])
+            return int(role_id[role])
         return None
         
     def exist_role(self, ctx, role):
@@ -177,6 +177,7 @@ class __Roles(commands.Cog, name = '役職の管理'):
     async def add(self, ctx, role):
         """役職を付与：slave->レイドの奴隷、call->通話通知"""
         r = self.exist_role(ctx, role)
+        print(r)
         if (r == None):
             await send_message(ctx.send, ctx.author.mention, role+'オプションは実装されていません\n実装済みのオプション：\'slave\', \'call\'')
         else:
@@ -343,6 +344,12 @@ class __Event(commands.Cog, name= 'イベント管理'):
                     await send_message(ctx.send, ctx.author.mention, 'イベントの開始をキャンセルしました')
             else:
                 await self.send_err(ctx, -2)
+
+@bot.command()
+async def shuffle(ctx, *arguments):
+    """与えられた要素をシャッフル"""
+    await send_message(ctx.send, ctx.author.mention, cmd_other.shuffle(list(arguments)), title = '結果')
+    return
 
 @bot.command()
 async def card(ctx, *pokes):
@@ -673,7 +680,6 @@ async def on_raw_reaction_add(payload):
 ################################
 @bot.event
 async def on_voice_state_update(member, before, after):
-    global vc_state
     result = await vc.move_member(member, before, after, config.get('default', 'server'), int(channel_id['afk']))
     vc_state += result[0]
     if (result[1] == 1 and vc_state == 1):
