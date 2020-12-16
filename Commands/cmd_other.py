@@ -1,6 +1,8 @@
 import re
+import random
 
 def calcform(form):
+    print(form)
     if (len(form) == 0):
         return 0.0
     
@@ -57,3 +59,13 @@ def calc(formula):
     except ZeroDivisionError:
         form_tree = '0で除算しました'
     return 1, form_tree
+
+def shuffle(argv):
+    l = len(argv)
+    if (l <= 0):
+        return []
+
+    for i in range(l):
+        r = random.randrange(l - i)
+        argv[r], argv[l-i-1] = argv[l-i-1], argv[r]
+    return argv
