@@ -685,7 +685,7 @@ async def on_voice_state_update(member, before, after):
     if (result[1] == 1 and vc_state == 1):
         print('通話開始')
         channel = bot.get_channel(int(channel_id['call']))
-        role = bot.get_guild(config.get('default', 'server')).get_role(int(channel_id['call']))
+        role = bot.get_guild(config.get('default', 'server')).get_role(int(role_id['call']))
         await channel.send(f'{role.mention} 通話が始まりました')
         
 bot.add_cog(__Roles(bot=bot))
