@@ -680,12 +680,13 @@ async def on_raw_reaction_add(payload):
 ################################
 @bot.event
 async def on_voice_state_update(member, before, after):
-    result = await vc.move_member(member, before, after, config.get('default', 'server'), int(channel_id['afk']))
+    global vc_state
+    result = await vc.move_member(member, before, after, int(config.get('DEFAULT', 'server')), [int(channel_id['afk'])])
     vc_state += result[0]
     if (result[1] == 1 and vc_state == 1):
         print('通話開始')
         channel = bot.get_channel(int(channel_id['call']))
-        role = bot.get_guild(config.get('default', 'server')).get_role(int(role_id['call']))
+        role = bot.get_guild(int(config.get('DEFAULT', 'server'))).get_role(int(role_id['call']))
         await channel.send(f'{role.mention} 通話が始まりました')
         
 bot.add_cog(__Roles(bot=bot))
