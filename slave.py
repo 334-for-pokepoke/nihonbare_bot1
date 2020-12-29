@@ -5,6 +5,9 @@ import sys
 import re
 import asyncio
 import configparser
+import pathlib
+import random
+from glob import glob
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Commands'))
 import cmd_raid
 import cmd_card
@@ -17,6 +20,7 @@ import cmd_event
 import vc
 import rw_csv
 import userinfo
+import image_
 
 MAINPATH     = os.path.dirname(os.path.abspath(__file__)) #このファイルの位置
 CONFIG_PATH  = '' + MAINPATH + '/Data/config.ini'
@@ -31,12 +35,15 @@ role_id    = dict(config.items('ROLE'))
 def get_path(name):
     return MAINPATH + config.get('DIR', name)
 
+now_vc       = None
 vc_state     = 0                        #ボイスチャンネルにいる人の数を0で初期化
+voice        = None
 TOKEN_PATH   = get_path('token')
 STOCK_PATH   = get_path('stock')
 IMG_PATH     = get_path('img')
 SQLCMD_PATH  = get_path('sql_cmd')
 EVENT_PATH   = get_path('event')
+MUSIC_PATH   = config.get('DIR', 'bgm')
 
 #TOKENの読み込み
 with open(TOKEN_PATH, "r",encoding="utf-8_sig") as f:
@@ -58,8 +65,52 @@ class JapaneseHelpCommand(commands.DefaultHelpCommand):
         return (f"各コマンドの説明: {prefix}help <コマンド名>\n"
                 f"各カテゴリの説明: {prefix}help <カテゴリ名>\n")
 
+class AudioQueue(asyncio.Queue):
+    def __init__(self):
+        super().__init__(100)
+
+    def __getitem__(self, idx):
+        return self._queue[idx]
+
+    def to_list(self):
+        return list(self._queue)
+
+    def reset(self):
+        self._queue.clear()
+
+class AudioStatus:
+    def __init__(self, vc):
+        self.vc = vc
+        self.queue = AudioQueue()
+        self.playing = asyncio.Event()
+        asyncio.ensure_future(self.playing_task())
+
+    async def add_audio(self, title, path):
+        await self.queue.put([title, path])
+    
+    async def playing_task(self):
+        while True:
+            self.playing.clear()
+            try:
+                title, path = await asyncio.wait_for(self.queue.get(), timeout = 100)
+            except asyncio.TimeoutError:
+                asyncio.ensure_future(self.leave())
+            self.vc.play(discord.FFmpegPCMAudio(executable=MAINPATH+"/ffmpeg.exe", source=path), after = self.play_next)
+            activity = discord.Activity(name=title, type=discord.ActivityType.listening)
+            await bot.change_presence(activity=activity)
+            await self.playing.wait()
+    
+    def play_next(self, err_None):
+        self.playing.set()
+            
+    async def leave(self):
+        self.queue.reset()
+        if self.vc:
+            await self.vc.disconnect()
+            self.vc = None
+
 #botの作成
-bot = commands.Bot(command_prefix='!', help_command=JapaneseHelpCommand())
+bot = commands.Bot(command_prefix='\\', help_command=JapaneseHelpCommand())
 
 # bot起動時に"login"と表示
 @bot.event
@@ -84,6 +135,41 @@ async def on_command_error(ctx, error):
 
 #botが自分自身を区別するための関数
 is_me = lambda m: m.author == bot.user
+
+def make_filetree(path, layer=0, is_last=False, indent_current='　', ):
+    d = []
+    if not pathlib.Path(path).is_absolute():
+        path = str(pathlib.Path(path).resolve())
+
+    # カレントディレクトリの表示
+    current = path.split(os.sep)[::-1][0]
+    d.append(pathlib.Path(current).parts[-1])
+    if layer == 0:
+        pass
+        #print('<'+current+'>')
+    else:
+        branch = '└' if is_last else '├'
+        #print('{indent}{branch}<{dirname}>'.format(indent=indent_current, branch=branch, dirname=pathlib.Path(current).parts[-1]))
+
+    # 下の階層のパスを取得
+    paths = [p for p in glob(path+'/*') if os.path.isdir(p) or os.path.isfile(p)]
+    def is_last_path(i):
+        return i == len(paths)-1
+
+    # 再帰的に表示
+    for i, p in enumerate(paths):
+
+        indent_lower = indent_current
+        if layer != 0:
+            indent_lower += '　　' if is_last else '│　'
+
+        if os.path.isfile(p):
+            pass
+            #branch = '└' if is_last_path(i) else '├'
+            #print('{indent}{branch}{filename}'.format(indent=indent_lower, branch=branch, filename=os.path.splitext(os.path.basename(p))[0]))
+        if os.path.isdir(p):
+            d.append(make_filetree(p, layer=layer+1, is_last=is_last_path(i), indent_current=indent_lower))
+    return d
 
 def listcontent(list_):
     if (type(list_) is not list):
@@ -344,6 +430,163 @@ class __Event(commands.Cog, name= 'イベント管理'):
                     await send_message(ctx.send, ctx.author.mention, 'イベントの開始をキャンセルしました')
             else:
                 await self.send_err(ctx, -2)
+
+class __BGM(commands.Cog, name= 'BGM管理'):
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+        self.mn = ''
+        self.audio_status = None
+
+    @commands.command()
+    async def remove(self, ctx):
+        """botをvcから切断"""
+        global voice, now_vc
+        if (voice is None):
+            return
+        await voice.disconnect()
+        activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
+        await bot.change_presence(activity=activity)
+        now_vc = None
+        voice = None
+        await ctx.message.delete()
+        return
+
+    @commands.command()
+    async def bgm(self, ctx, *bgm_or_dir_name):
+        """キューを使って再生"""
+        os.chdir(MUSIC_PATH)
+        name = ''
+        for s in bgm_or_dir_name:
+            name += s + ' '
+        name = name[:-1]
+        global voice, now_vc
+        if (ctx.author.voice is None):
+            await send_message(ctx.send, ctx.author.mention, 'ボイスチャンネルが見つかりません')
+            return
+        
+        if ((now_vc is None) or (now_vc != ctx.author.voice.channel)):
+            now_vc = ctx.author.voice.channel
+            voice = await bot.get_channel(now_vc.id).connect()
+            self.audio_status = AudioStatus(voice)
+
+        music_pathes = [p for p in glob('Music/**', recursive=True) if os.path.isfile(p)]
+        music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
+        length = len(music_titles)
+        for i in range(length):
+            if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
+                music_titles[i] = (music_titles[i])[3:]
+
+        music_dirs = glob(os.path.join('Music', '**' + os.sep), recursive=True)
+        mdir_name  = [pathlib.Path(f).parts[-1] for f in music_dirs]
+        
+        if (len(name) == 0):
+            numbers = [i for i in range(len(music_pathes))]
+            random.shuffle(numbers)
+            await ctx.message.delete()
+            for i in numbers:
+                await self.audio_status.add_audio(music_titles[i], music_pathes[i])
+        elif (name in music_titles):
+            idx = music_titles.index(name)
+            await ctx.message.delete()
+            await self.audio_status.add_audio(name, music_pathes[idx])
+        elif (name in mdir_name):
+            idx = mdir_name.index(name)
+            os.chdir(MUSIC_PATH + os.sep + music_dirs[idx])
+            music_pathes = [p for p in glob('**', recursive=True) if os.path.isfile(p)]
+            music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
+            length = len(music_titles)
+            for i in range(length):
+                if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
+                    music_titles[i] = (music_titles[i])[3:]
+            numbers = [i for i in range(len(music_pathes))]
+            random.shuffle(numbers)
+            await ctx.message.delete()
+            for i in numbers:
+                await self.audio_status.add_audio(music_titles[i], music_pathes[i])
+        else:
+            send_message(ctx.send, '', 'Audio File Not Found')
+        return
+
+    @commands.command()
+    async def pause(self, ctx):
+        """再生中のbgmの一時停止"""
+        global voice
+        voice.pause()
+        await ctx.message.delete()
+        return
+        
+    @commands.command()
+    async def resume(self, ctx):
+        """再生中のbgmの再開"""
+        global voice
+        voice.resume()
+        await ctx.message.delete()
+        return
+
+    @commands.command()
+    async def stop(self, ctx):
+        """再生中のbgmの中断"""
+        global voice
+        voice.stop()
+        await self.remove(ctx)
+        return
+
+    @commands.command()
+    async def queue(self, ctx):
+        """再生キューの表示"""
+        await send_message(ctx.send, '', [x[0] for x in self.audio_status.queue], title = '再生キュー', isembed = True)
+        return
+
+    @commands.command()
+    async def bgmlist(self, ctx, *dir_name):
+        """一覧"""
+        os.chdir(MUSIC_PATH)
+        dirname = ''
+        for s in dir_name:
+            dirname += s + ' '
+        dirname = dirname[:-1]
+        if (len(dirname) == 0):
+            tree = make_filetree(MUSIC_PATH+os.sep+'Music')
+            print(MUSIC_PATH+os.sep+'Music')
+            await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
+        else:
+            music_dirs = glob(os.path.join('Music', '**'), recursive=True)
+            for f in music_dirs:
+                if (dirname == pathlib.Path(f).parts[-1]):
+                    current = f.split(os.sep)[1:][0]
+                    tree = make_filetree(MUSIC_PATH+os.sep+f)
+                    if (len(tree) != 1):
+                        await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
+                    else:
+                        os.chdir(MUSIC_PATH + os.sep + f)
+                        music_titles = [os.path.splitext(os.path.basename(p))[0] for p in glob('*', recursive=True) if os.path.isfile(p)]
+                        length = len(music_titles)
+                        for i in range(length):
+                            if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
+                                music_titles[i] = (music_titles[i])[3:]
+                        await send_message(ctx.send, '', music_titles)
+                    break
+        return
+    
+    @commands.command()
+    async def addbgm(self, ctx, *info):
+        """bgmの追加：infoはファイルパス"""
+        os.chdir(MUSIC_PATH)
+        attach = ctx.message.attachments
+        if (attach and len(info) > 1):
+            fpath = ''
+            for p in info[:-1]:
+                fpath += p + os.sep
+            filepath = MUSIC_PATH + os.sep + 'Music' + os.sep + fpath + info[-1] + os.path.splitext(attach[0].url)[-1]
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            result = await image_.audio_dl(attach[0].url, filepath)
+            if (result):
+                await send_message(ctx.send, ctx.author.mention, '追加しました')
+                print(f'addbgm:{info}')
+            else:
+                await send_message(ctx.send, ctx.author.mention, '失敗しました')
+        return
 
 @bot.command()
 async def shuffle(ctx, *arguments):
@@ -680,7 +923,9 @@ async def on_raw_reaction_add(payload):
 ################################
 @bot.event
 async def on_voice_state_update(member, before, after):
-    global vc_state
+    global voice, vc_state, now_vc
+    if (member == bot.user):
+        return
     result = await vc.move_member(member, before, after, int(config.get('DEFAULT', 'server')), [int(channel_id['afk'])])
     vc_state += result[0]
     if (result[1] == 1 and vc_state == 1):
@@ -688,11 +933,20 @@ async def on_voice_state_update(member, before, after):
         channel = bot.get_channel(int(channel_id['call']))
         role = bot.get_guild(int(config.get('DEFAULT', 'server'))).get_role(int(role_id['call']))
         await channel.send(f'{role.mention} 通話が始まりました')
-        
+    elif ((now_vc is not None) and (len(now_vc.members) == 1) and (voice is not None)):
+        print(now_vc.members)
+        await voice.disconnect()
+        activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
+        await bot.change_presence(activity=activity)
+        voice = None
+        now_vc = None
+    return
+
 bot.add_cog(__Roles(bot=bot))
 bot.add_cog(__Raid(bot=bot))
 bot.add_cog(__Status(bot=bot))
 bot.add_cog(__SQL(bot=bot))
 bot.add_cog(__Home(bot=bot))
 bot.add_cog(__Event(bot=bot))
+bot.add_cog(__BGM(bot=bot))
 bot.run(TOKEN)
