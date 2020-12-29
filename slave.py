@@ -10,7 +10,6 @@ import random
 from glob import glob
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Commands'))
 import cmd_raid
-import cmd_card
 import cmd_status
 import cmd_sql
 import cmd_home
@@ -592,21 +591,6 @@ class __BGM(commands.Cog, name= 'BGM管理'):
 async def shuffle(ctx, *arguments):
     """与えられた要素をシャッフル"""
     await send_message(ctx.send, ctx.author.mention, cmd_other.shuffle(list(arguments)), title = '結果')
-    return
-
-@bot.command()
-async def card(ctx, *pokes):
-    """簡易な構築の画像を生成"""
-    #ユーザーアイコンDL
-    await ctx.message.author.avatar_url.save(IMG_PATH+'user.png', seek_begin = True)
-    res, candidate = await cmd_card.makecard(pokes, IMG_PATH)
-    file_img = discord.File(IMG_PATH+'out.jpg')
-    await ctx.send(file=file_img)
-    await ctx.message.delete()
-    if (res == 0):
-        if (len(candidate) == 1):
-            candidate.append([''])
-        await send_message(ctx.send, ctx.author.mention, candidate, delimiter = ['\n', '\n'], title = 'もしかして')
     return
         
 @bot.command()
