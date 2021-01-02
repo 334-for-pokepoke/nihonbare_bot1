@@ -22,7 +22,7 @@ def sqlreq(cmd, argtpl):
         return True, result[0]
 
 def addsql(arg, SQLCMD_PATH):
-    MAX_TABLE  = 4
+    MAX_TABLE  = 8
     if (len(arg) <= 1):
         return -1, None     #不適切なコマンド
     cmd = arg[0]
@@ -164,7 +164,7 @@ def editsql(mes, SQLCMD_PATH):
     return '説明文を追加しました'
 
 def registered_sql(mes, SQLCMD_PATH):
-    MAX_TABLE = 4
+    MAX_TABLE = 8
     if os.path.getsize(SQLCMD_PATH) <= 0:
         return False, 'エラー：コマンドが見つかりません'
     lmes = mes.split()
