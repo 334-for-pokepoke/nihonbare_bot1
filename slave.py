@@ -10,7 +10,6 @@ import random
 from glob import glob
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Commands'))
 import cmd_raid
-import cmd_card
 import cmd_status
 import cmd_sql
 import cmd_home
