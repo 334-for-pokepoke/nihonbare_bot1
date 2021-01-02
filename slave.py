@@ -10,12 +10,14 @@ import random
 from glob import glob
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Commands'))
 import cmd_raid
+import cmd_card
 import cmd_status
 import cmd_sql
 import cmd_home
 import cmd_system
 import cmd_other
 import cmd_event
+import cmd_bgm
 import vc
 import rw_csv
 import userinfo
@@ -51,7 +53,7 @@ with open(TOKEN_PATH, "r",encoding="utf-8_sig") as f:
     TOKEN = l_strip[0]
 
 # "!"から始まるものをコマンドと認識する
-prefix = '!'
+prefix = '\\'
 #helpコマンドの日本語化
 class JapaneseHelpCommand(commands.DefaultHelpCommand):
     def __init__(self):
@@ -99,7 +101,7 @@ class AudioStatus:
             await bot.change_presence(activity=activity)
             await self.playing.wait()
     
-    def play_next(self, err_None):
+    def play_next(self, err=None):
         self.playing.set()
             
     async def leave(self):
@@ -108,8 +110,11 @@ class AudioStatus:
             await self.vc.disconnect()
             self.vc = None
 
+    def is_playing(self):
+        return self.vc.is_playing()
+
 #botの作成
-bot = commands.Bot(command_prefix='\\', help_command=JapaneseHelpCommand())
+bot = commands.Bot(command_prefix=prefix, help_command=JapaneseHelpCommand())
 
 # bot起動時に"login"と表示
 @bot.event
@@ -135,41 +140,6 @@ async def on_command_error(ctx, error):
 #botが自分自身を区別するための関数
 is_me = lambda m: m.author == bot.user
 
-def make_filetree(path, layer=0, is_last=False, indent_current='　', ):
-    d = []
-    if not pathlib.Path(path).is_absolute():
-        path = str(pathlib.Path(path).resolve())
-
-    # カレントディレクトリの表示
-    current = path.split(os.sep)[::-1][0]
-    d.append(pathlib.Path(current).parts[-1])
-    if layer == 0:
-        pass
-        #print('<'+current+'>')
-    else:
-        branch = '└' if is_last else '├'
-        #print('{indent}{branch}<{dirname}>'.format(indent=indent_current, branch=branch, dirname=pathlib.Path(current).parts[-1]))
-
-    # 下の階層のパスを取得
-    paths = [p for p in glob(path+'/*') if os.path.isdir(p) or os.path.isfile(p)]
-    def is_last_path(i):
-        return i == len(paths)-1
-
-    # 再帰的に表示
-    for i, p in enumerate(paths):
-
-        indent_lower = indent_current
-        if layer != 0:
-            indent_lower += '　　' if is_last else '│　'
-
-        if os.path.isfile(p):
-            pass
-            #branch = '└' if is_last_path(i) else '├'
-            #print('{indent}{branch}{filename}'.format(indent=indent_lower, branch=branch, filename=os.path.splitext(os.path.basename(p))[0]))
-        if os.path.isdir(p):
-            d.append(make_filetree(p, layer=layer+1, is_last=is_last_path(i), indent_current=indent_lower))
-    return d
-
 def listcontent(list_):
     if (type(list_) is not list):
         return list_
@@ -191,7 +161,7 @@ def list2str(list_, delimiter):
             result += str(s) + d
     return result[:-1*len(d)]
 
-async def send_message(send_method, mention, mes, title = 'Result', delimiter = ['\n'], isembed = True):
+async def send_message(send_method, mention, mes, title = 'Result', delimiter = ['\n'], isembed = True, senderr = True):
     message = None
     mtype = type(mes)
     if (mtype is list):
@@ -207,7 +177,9 @@ async def send_message(send_method, mention, mes, title = 'Result', delimiter = 
                     embed = discord.Embed(title=title, description=reply)
                     message = await send_method(f'{mention} ', embed=embed)
                 except:
-                    message = await send_method(f'{mention} エラー：該当するデータが多すぎます')
+                    if (senderr):
+                        await send_method(f'{mention} エラー：該当するデータが多すぎます')
+                    message = None
             else:
                 message = await send_message(send_method, mention, '\n'+reply, title = title)
     elif (mtype is str):
@@ -437,12 +409,27 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         self.mn = ''
         self.audio_status = None
 
+    async def send_tree(self, ctx, path, nest = -1):
+        if (nest == 0):
+            await send_message(ctx.send, '', 'エラー：該当するデータが多すぎます')
+        if (nest == -1):
+            tree = cmd_bgm.make_filetree(path)
+            nest = cmd_bgm.depth(tree)
+        else:
+            tree = cmd_bgm.make_filetree(path, nest = nest)
+        result = await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(nest)], senderr = False)
+        if (result is None):
+            await self.send_tree(ctx, path, nest = nest-1)
+        return
+    
     @commands.command()
     async def remove(self, ctx):
         """botをvcから切断"""
         global voice, now_vc
         if (voice is None):
             return
+        await self.stop(ctx)
+        await self.clear(ctx)
         await voice.disconnect()
         activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
         await bot.change_presence(activity=activity)
@@ -454,6 +441,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
     @commands.command()
     async def bgm(self, ctx, *bgm_or_dir_name):
         """キューを使って再生"""
+        cur_path = os.getcwd()
         os.chdir(MUSIC_PATH)
         name = ''
         for s in bgm_or_dir_name:
@@ -462,6 +450,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         global voice, now_vc
         if (ctx.author.voice is None):
             await send_message(ctx.send, ctx.author.mention, 'ボイスチャンネルが見つかりません')
+            os.chdir(cur_path)          #カレントディレクトリを戻す
             return
         
         if ((now_vc is None) or (now_vc != ctx.author.voice.channel)):
@@ -480,20 +469,23 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         mdir_name  = [pathlib.Path(f).parts[-1] for f in music_dirs]
         
         if (len(name) == 0):
+            os.chdir(cur_path)          #カレントディレクトリを戻す
             numbers = [i for i in range(len(music_pathes))]
             random.shuffle(numbers)
             await ctx.message.delete()
             for i in numbers:
-                await self.audio_status.add_audio(music_titles[i], music_pathes[i])
+                await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + music_pathes[i])
         elif (name in music_titles):
+            os.chdir(cur_path)          #カレントディレクトリを戻す
             idx = music_titles.index(name)
             await ctx.message.delete()
-            await self.audio_status.add_audio(name, music_pathes[idx])
+            await self.audio_status.add_audio(name, MUSIC_PATH + os.sep + music_pathes[idx])
         elif (name in mdir_name):
             idx = mdir_name.index(name)
             os.chdir(MUSIC_PATH + os.sep + music_dirs[idx])
             music_pathes = [p for p in glob('**', recursive=True) if os.path.isfile(p)]
             music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
+            os.chdir(cur_path)          #カレントディレクトリを戻す
             length = len(music_titles)
             for i in range(length):
                 if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
@@ -502,35 +494,40 @@ class __BGM(commands.Cog, name= 'BGM管理'):
             random.shuffle(numbers)
             await ctx.message.delete()
             for i in numbers:
-                await self.audio_status.add_audio(music_titles[i], music_pathes[i])
+                await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + music_dirs[idx] + os.sep + music_pathes[i])
         else:
+            os.chdir(cur_path)          #カレントディレクトリを戻す
             send_message(ctx.send, '', 'Audio File Not Found')
         return
 
     @commands.command()
     async def pause(self, ctx):
         """再生中のbgmの一時停止"""
-        global voice
-        voice.pause()
+        if (self.audio_status.is_playing()):
+            self.audio_status.vc.pause()
         await ctx.message.delete()
         return
         
     @commands.command()
     async def resume(self, ctx):
         """再生中のbgmの再開"""
-        global voice
-        voice.resume()
+        self.audio_status.vc.resume()
         await ctx.message.delete()
         return
 
     @commands.command()
     async def stop(self, ctx):
         """再生中のbgmの中断"""
-        global voice
-        voice.stop()
-        await self.remove(ctx)
+        if (self.audio_status.is_playing()):
+            self.audio_status.vc.stop()
         return
 
+    @commands.command()
+    async def clear(self, ctx):
+        """再生キューのリセット"""
+        self.audio_status.queue.reset()
+        return
+    
     @commands.command()
     async def queue(self, ctx):
         """再生キューの表示"""
@@ -540,23 +537,25 @@ class __BGM(commands.Cog, name= 'BGM管理'):
     @commands.command()
     async def bgmlist(self, ctx, *dir_name):
         """一覧"""
+        cur_path = os.getcwd()
         os.chdir(MUSIC_PATH)
         dirname = ''
         for s in dir_name:
             dirname += s + ' '
         dirname = dirname[:-1]
         if (len(dirname) == 0):
-            tree = make_filetree(MUSIC_PATH+os.sep+'Music')
-            print(MUSIC_PATH+os.sep+'Music')
-            await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
+            await self.send_tree(ctx=ctx, path=MUSIC_PATH+os.sep+'Music')
         else:
             music_dirs = glob(os.path.join('Music', '**'), recursive=True)
             for f in music_dirs:
                 if (dirname == pathlib.Path(f).parts[-1]):
                     current = f.split(os.sep)[1:][0]
-                    tree = make_filetree(MUSIC_PATH+os.sep+f)
+                    tree = cmd_bgm.make_filetree(MUSIC_PATH+os.sep+f)
                     if (len(tree) != 1):
-                        await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
+                        result = await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
+                        if (result is None):
+                            nest = cmd_bgm.depth(tree)
+                            await self.send_tree(ctx=ctx, path=MUSIC_PATH+os.sep+f, nest = nest-1)
                     else:
                         os.chdir(MUSIC_PATH + os.sep + f)
                         music_titles = [os.path.splitext(os.path.basename(p))[0] for p in glob('*', recursive=True) if os.path.isfile(p)]
@@ -566,11 +565,13 @@ class __BGM(commands.Cog, name= 'BGM管理'):
                                 music_titles[i] = (music_titles[i])[3:]
                         await send_message(ctx.send, '', music_titles)
                     break
+        os.chdir(cur_path)
         return
     
     @commands.command()
     async def addbgm(self, ctx, *info):
         """bgmの追加：infoはファイルパス"""
+        cur_path = os.getcwd()
         os.chdir(MUSIC_PATH)
         attach = ctx.message.attachments
         if (attach and len(info) > 1):
@@ -585,12 +586,28 @@ class __BGM(commands.Cog, name= 'BGM管理'):
                 print(f'addbgm:{info}')
             else:
                 await send_message(ctx.send, ctx.author.mention, '失敗しました')
+        os.chdir(cur_path)
         return
 
 @bot.command()
 async def shuffle(ctx, *arguments):
     """与えられた要素をシャッフル"""
     await send_message(ctx.send, ctx.author.mention, cmd_other.shuffle(list(arguments)), title = '結果')
+    return
+
+@bot.command()
+async def card(ctx, *pokes):
+    """簡易な構築の画像を生成"""
+    #ユーザーアイコンDL
+    await ctx.message.author.avatar_url.save(IMG_PATH+'user.png', seek_begin = True)
+    res, candidate = await cmd_card.makecard(pokes, IMG_PATH)
+    file_img = discord.File(IMG_PATH+'out.jpg')
+    await ctx.send(file=file_img)
+    await ctx.message.delete()
+    if (res == 0):
+        if (len(candidate) == 1):
+            candidate.append([''])
+        await send_message(ctx.send, ctx.author.mention, candidate, delimiter = ['\n', '\n'], title = 'もしかして')
     return
         
 @bot.command()
