@@ -67,7 +67,7 @@ class JapaneseHelpCommand(commands.DefaultHelpCommand):
 
 class AudioQueue(asyncio.Queue):
     def __init__(self):
-        super().__init__(100)
+        super().__init__(0)
 
     def __getitem__(self, idx):
         return self._queue[idx]
@@ -83,7 +83,7 @@ class AudioStatus:
         self.vc = vc
         self.queue = AudioQueue()
         self.playing = asyncio.Event()
-        asyncio.ensure_future(self.playing_task())
+        asyncio.create_task(self.playing_task())
 
     async def add_audio(self, title, path):
         await self.queue.put([title, path])
@@ -94,7 +94,7 @@ class AudioStatus:
             try:
                 title, path = await asyncio.wait_for(self.queue.get(), timeout = 100)
             except asyncio.TimeoutError:
-                asyncio.ensure_future(self.leave())
+                asyncio.create_task(self.leave())
             self.vc.play(discord.FFmpegPCMAudio(executable=MAINPATH+"/ffmpeg.exe", source=path), after = self.play_next)
             activity = discord.Activity(name=title, type=discord.ActivityType.listening)
             await bot.change_presence(activity=activity)
@@ -108,9 +108,15 @@ class AudioStatus:
         if self.vc:
             await self.vc.disconnect()
             self.vc = None
-
+    
     def is_playing(self):
         return self.vc.is_playing()
+    
+    def is_connected(self):
+        return self.vc.is_connected()
+
+    def is_closed(self):
+        return (self.vc is None or self.vc.is_closed())
 
 #botの作成
 bot = commands.Bot(command_prefix=prefix, help_command=JapaneseHelpCommand())
@@ -407,6 +413,15 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         self.bot = bot
         self.mn = ''
         self.audio_status = None
+    
+    async def reload_state(self):
+        if (self.audio_status == None or self.audio_status.is_closed()):
+            global voice, now_vc
+            activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
+            await bot.change_presence(activity=activity)
+            now_vc = None
+            voice = None
+        return
 
     async def send_tree(self, ctx, path, nest = -1):
         if (nest == 0):
@@ -425,6 +440,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
     async def remove(self, ctx):
         """botをvcから切断"""
         global voice, now_vc
+        await self.reload_state()
         if (voice is None):
             return
         await self.stop(ctx)
@@ -447,6 +463,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
             name += s + ' '
         name = name[:-1]
         global voice, now_vc
+        await self.reload_state()
         if (ctx.author.voice is None):
             await send_message(ctx.send, ctx.author.mention, 'ボイスチャンネルが見つかりません')
             os.chdir(cur_path)          #カレントディレクトリを戻す
@@ -911,7 +928,7 @@ async def on_voice_state_update(member, before, after):
     global voice, vc_state, now_vc
     if (member == bot.user):
         return
-    result = await vc.move_member(member, before, after, int(config.get('DEFAULT', 'server')), [int(channel_id['afk'])])
+    result = await vc.move_member(member, before, after, int(config.get('DEFAULT', 'server')), [int(channel_id['afk']), int(channel_id['afk2'])])
     vc_state += result[0]
     if (result[1] == 1 and vc_state == 1):
         print('通話開始')
