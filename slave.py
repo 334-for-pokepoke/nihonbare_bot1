@@ -719,14 +719,13 @@ class __SQL(commands.Cog, name = 'SQL'):
         return
 
     @commands.command()
+    async def editsql(self, ctx, *sqlcmdname_information):
+        """登録したSQLコマンドに説明を加える"""
+        return
+
+    @commands.command()
     async def addsql(self, ctx, *cmd_SQL):
         """新規SQL文の登録"""
-        res, cmd = cmd_sql.addsql(cmd_SQL, SQLCMD_PATH)
-        if (res == 1):
-            await send_message(ctx.send, ctx.author.mention, 'コマンド「'+cmd+'」が登録されました')
-            print('addcmd='+cmd)
-        else:
-            await self.make_err(ctx, res)
         return
       
     @commands.command()
@@ -885,6 +884,25 @@ async def on_message(message):
     head = content[:9].lower()
     if head == '!editsql ':
         await send_message(message.channel.send, message.author.mention, cmd_sql.editsql(iter(content), SQLCMD_PATH))
+        return
+    
+    if head[:8] == '!addsql ':
+        print(content[8:])
+        res, cmd = cmd_sql.addsql(content[8:].split(), SQLCMD_PATH)
+        if (res == 1):
+            await send_message(message.channel.send, message.author.mention, 'コマンド「'+cmd+'」が登録されました')
+            print('addcmd='+cmd)
+        else:
+            if (res == -1):
+                await send_message(message.channel.send, message.author.mention, 'エラー：コマンドが不適切です')
+            if (res == -2):
+                await send_message(message.channel.send, message.author.mention, 'エラー：既に定義されています')
+            if (res == -3):
+                await send_message(message.channel.send, message.author.mention, 'エラー：コマンドが登録されていません')
+            if (res == -4):
+                await send_message(message.channel.send, message.author.mention, 'エラー：コマンドが見つかりません')
+            if (res == -5):
+                await send_message(message.channel.send, message.author.mention, '<:9mahogyaku:766976884562198549>')
         return
     
     if(content.startswith('?')):
