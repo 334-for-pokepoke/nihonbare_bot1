@@ -9,13 +9,11 @@ import pathlib
 import random
 from glob import glob
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Commands'))
-import cmd_raid
 import cmd_status
 import cmd_sql
 import cmd_home
 import cmd_system
 import cmd_other
-import cmd_event
 import cmd_bgm
 import vc
 import rw_csv
@@ -35,9 +33,9 @@ role_id    = dict(config.items('ROLE'))
 def get_path(name):
     return MAINPATH + config.get('DIR', name)
 
-now_vc       = None
+now_vc       = None                     #
+voice        = None                     #現在参加しているボイスチャンネルをグローバル変数として管理する
 vc_state     = 0                        #ボイスチャンネルにいる人の数を0で初期化
-voice        = None
 TOKEN_PATH   = get_path('token')
 STOCK_PATH   = get_path('stock')
 IMG_PATH     = get_path('img')
@@ -52,7 +50,7 @@ with open(TOKEN_PATH, "r",encoding="utf-8_sig") as f:
     TOKEN = l_strip[0]
 
 # "!"から始まるものをコマンドと認識する
-prefix = '\\'
+prefix = '!'
 #helpコマンドの日本語化
 class JapaneseHelpCommand(commands.DefaultHelpCommand):
     def __init__(self):
@@ -65,58 +63,82 @@ class JapaneseHelpCommand(commands.DefaultHelpCommand):
         return (f"各コマンドの説明: {prefix}help <コマンド名>\n"
                 f"各カテゴリの説明: {prefix}help <カテゴリ名>\n")
 
+#bgmコマンドで使う再生キュー
 class AudioQueue(asyncio.Queue):
     def __init__(self):
-        super().__init__(0)
+        super().__init__(0)         #再生キューの上限を設定しない
 
     def __getitem__(self, idx):
-        return self._queue[idx]
+        return self._queue[idx]     #idx番目を取り出し
 
     def to_list(self):
-        return list(self._queue)
+        return list(self._queue)    #キューをリスト化
 
     def reset(self):
-        self._queue.clear()
+        self._queue.clear()         #キューのリセット
 
+#bgmコマンドで使う，現在の再生状況を管理するクラス
 class AudioStatus:
     def __init__(self, vc):
-        self.vc = vc
-        self.queue = AudioQueue()
+        self.vc = vc                                #自分が今入っているvc
+        self.queue = AudioQueue()                   #再生キュー
         self.playing = asyncio.Event()
         asyncio.create_task(self.playing_task())
+        self.bgminfo = None
 
-    async def add_audio(self, title, path):
-        await self.queue.put([title, path])
-    
+    #曲の追加
+    async def add_audio(self, title, path, isloop = False):
+        await self.queue.put([title, path, isloop])
+
+    #曲の再生（再生にはffmpegが必要）    
     async def playing_task(self):
         while True:
             self.playing.clear()
             try:
-                title, path = await asyncio.wait_for(self.queue.get(), timeout = 100)
+                title, path, isloop = await asyncio.wait_for(self.queue.get(), timeout = 100)
             except asyncio.TimeoutError:
-                asyncio.create_task(self.leave())
-            self.vc.play(discord.FFmpegPCMAudio(executable=MAINPATH+"/ffmpeg.exe", source=path), after = self.play_next)
-            activity = discord.Activity(name=title, type=discord.ActivityType.listening)
+                asyncio.ensure_future(self.leave())
+            self.vc.play(discord.FFmpegPCMAudio(source=path), after = self.play_next)
+            if (isloop):
+                await self.add_audio(title, path, isloop = True)
+            activity = discord.Activity(name=title, type=discord.ActivityType.listening)    #アクティビティの更新
+            self.bgminfo = path
             await bot.change_presence(activity=activity)
             await self.playing.wait()
     
+    #playing_taskの中で呼び出される
+    #再生が終わると次の曲を再生する
     def play_next(self, err=None):
+        self.bgminfo = None
         self.playing.set()
+        return
             
+    def playing_info(self):
+        if (self.bgminfo is None):
+            return 'This bot is not playing an Audio File'
+        return self.bgminfo[len(MUSIC_PATH)+1:]
+
+    #vcから切断
     async def leave(self):
-        self.queue.reset()
+        self.queue.reset()  #キューのリセット
+        self.bgminfo = None
         if self.vc:
             await self.vc.disconnect()
             self.vc = None
+        return
     
+    #曲が再生中ならtrue
     def is_playing(self):
         return self.vc.is_playing()
     
+    #vcに接続していればtrue
     def is_connected(self):
         return self.vc.is_connected()
 
+    #再生する曲が無くなる等でweb socketが切断されていればtrue
     def is_closed(self):
-        return (self.vc is None or self.vc.is_closed())
+        self.bgminfo = None
+        return (self.vc is None or (self.vc.is_connected() == False))
 
 #botの作成
 bot = commands.Bot(command_prefix=prefix, help_command=JapaneseHelpCommand())
@@ -131,7 +153,6 @@ async def on_ready():
 #コマンドに関するエラー
 @bot.event
 async def on_command_error(ctx, error):
-    print(type(error))
     if isinstance(error, commands.errors.MissingRequiredArgument):
         await ctx.send(f'{ctx.author.mention}エラー：引数の数が不正です')
         return
@@ -145,11 +166,13 @@ async def on_command_error(ctx, error):
 #botが自分自身を区別するための関数
 is_me = lambda m: m.author == bot.user
 
+#現状tuple等の送信に対応していないので応急処置
 def listcontent(list_):
     if (type(list_) is not list):
         return list_
     return listcontent(list_[0])
 
+#多重リストを区切り文字で展開する
 def list2str(list_, delimiter):
     result = ''
     if (len(delimiter) == 0):
@@ -166,7 +189,16 @@ def list2str(list_, delimiter):
             result += str(s) + d
     return result[:-1*len(d)]
 
-async def send_message(send_method, mention, mes, title = 'Result', delimiter = ['\n'], isembed = True, senderr = True):
+#文字列やリストの送信を行う関数
+#send_method：送信を行う関数
+#mention：メンション（空白文字列にすればメンションしない）
+#mes：発言する内容
+#title：embedを送信する場合のタイトル
+#delimiter：リストを文字列にする場合の区切り文字
+#isembed：リストを送信する場合にembedを使うならTrue
+#senderr：embedが文字数制限で送信できなかった場合にその旨を送信するならTrue
+#戻り値：メッセージの送信に成功したのであればそのメッセージが，embed等の送信に失敗すればNoneが返る
+async def send_message(send_method, mention, mes, title = 'Result', delimiter = ['\n'], isembed = True, senderr = True, half = False, ishalf = False):
     message = None
     mtype = type(mes)
     if (mtype is list):
@@ -177,11 +209,16 @@ async def send_message(send_method, mention, mes, title = 'Result', delimiter = 
             
         else:
             reply = list2str(mes, delimiter)
+            if (ishalf):
+                reply += "\n………"
             if (isembed):
                 try:
                     embed = discord.Embed(title=title, description=reply)
                     message = await send_method(f'{mention} ', embed=embed)
                 except:
+                    if (half and len(mes) > 1):
+                        message = await send_message(send_method, mention, mes[:int(len(mes)/2)], title, delimiter, isembed, senderr, half, ishalf = True)
+                        return message
                     if (senderr):
                         await send_method(f'{mention} エラー：該当するデータが多すぎます')
                     message = None
@@ -198,6 +235,9 @@ async def send_message(send_method, mention, mes, title = 'Result', delimiter = 
         pass
     return message
 
+#確認を取るメッセージ(y)の受理
+#30s以内に対象とするメンバーがyと発言すればTrue, そうでなければFalseが返る
+#member：確認を取る対象
 async def confirm(member):
     def check_y(m):
         return (m.content == 'y') and (m.author == member)
@@ -208,6 +248,9 @@ async def confirm(member):
     else:
         return True
 
+#発言の削除を行う
+#_channel：削除する発言があるch
+#mes_id：削除する発言のメッセージID
 async def del_message(_channel, mes_id):
     channel = bot.get_channel(_channel)
     try:
@@ -218,211 +261,44 @@ async def del_message(_channel, mes_id):
         pass
     return
 
-class __Roles(commands.Cog, name = '役職の管理'):
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    def select_roll(self, role):
-        if role == 'slave' or role == 'call':
-            return int(role_id[role])
-        return None
-        
-    def exist_role(self, ctx, role):
-        r = self.select_roll(role)
-        if (r == None):
-            return None
-        return ctx.message.guild.get_role(r)
-
-    @commands.command()
-    # 役職の付与
-    async def add(self, ctx, role):
-        """役職を付与：slave->レイドの奴隷、call->通話通知"""
-        r = self.exist_role(ctx, role)
-        print(r)
-        if (r == None):
-            await send_message(ctx.send, ctx.author.mention, role+'オプションは実装されていません\n実装済みのオプション：\'slave\', \'call\'')
-        else:
-            print(str(ctx.message.author.name)+'->'+str(role))
-            await ctx.author.add_roles(r)
-            await send_message(ctx.send, ctx.author.mention, '役職を追加しました')
-        return
-        
-    # 役職の解除
-    @commands.command()
-    async def rm(self, ctx, role):
-        """役職を解除"""
-        r = self.exist_role(ctx, role)
-        if (r == None):
-            await send_message(ctx.send, ctx.author.mention, role+'オプションは実装されていません\n実装済みのオプション：\'slave\', \'call\'')
-        else:
-            print(str(ctx.message.author.name)+' del '+str(role))
-            await ctx.author.remove_roles(r)
-            await send_message(ctx.send, ctx.author.mention, '役職を削除しました')
-        return
-
-class __Raid(commands.Cog, name = 'レイド関連'):
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    def make_err(self, res):
-        if (res[0] == -1):
-            return 'ポケモン名が短すぎます。ポケモン名は3文字以上にしてください。'
-        if (res[0] == -2):
-            return res[1]+'\nのレイドは開催済みです'
-        return
-        
-    # 在庫の確認
-    @commands.command()
-    async def check(self, ctx, poke):
-        """レイドが開催済みかどうかを検索"""
-        print('check:' + poke)
-        res = cmd_raid.process_raid_check(poke, STOCK_PATH)
-        if (res[0] == 1):
-            await send_message(ctx.send, ctx.author.mention, str(poke) + 'レイドのデータはありません')
-        else:
-            await send_message(ctx.send, ctx.author.mention, self.make_err(res))
-        return
-        
-    @commands.command()
-    async def store(self, ctx, poke):
-        """開催済みレイドの追加"""
-        print('add:' + poke)
-        res = cmd_raid.process_raid_add(poke, STOCK_PATH)
-        if (res[0] == 1):
-            await send_message(ctx.send, ctx.author.mention, str(poke) + 'レイドを登録しました')
-        else:
-            await send_message(ctx.send, ctx.author.mention, self.make_err(res))
-        return
-
-    @commands.command()
-    async def raid(self, ctx, cmd, poke):
-        """レイド関連のコマンド：add->store, check, del:削除（HOSTのみ使用可)"""
-        if (cmd == 'add'):
-            self.store(ctx, poke)
-            return
-        if (cmd == 'check'):
-            self.check(ctx, poke)
-            return
-        if (cmd == 'del'):
-            if (ctx.message.author.top_role.id != int(role_id['host'])):
-                await send_message(ctx.send, ctx.author.mention, '権限が足りません')
-                return
-            print('del:' + poke)
-            res = cmd_raid.process_raid_del(poke, int(role_id['host']), STOCK_PATH)
-            if (res[0] == 1):
-                await send_message(ctx.send, ctx.author.mention, '\n' + str(poke) + 'レイドを削除しました')
-            elif (res[0] == 0):
-                await send_message(ctx.send, ctx.author.mention, '\n' + str(poke) + 'レイドが見つかりませんでした')
-            else:
-                await send_message(ctx.send, ctx.author.mention, self.make_err(res))
-            return
-        return
-
-class __Event(commands.Cog, name= 'イベント管理'):
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-        self.event_status = rw_csv.read_csv(EVENT_PATH)
-    
-    def have_authority(self, author, organizer):
-        return (author.top_role.id == int(role_id['host'])) or (str(author.id) == organizer)
-
-    def delete_event(self, num):
-        del self.event_status[num]
-        rw_csv.write_csv(EVENT_PATH, self.event_status)
-        return
-
-    async def send_err(self, ctx, errtype):
-        if(errtype >= 0):
-            await send_message(ctx.send, ctx.author.mention, 'エラー:同名のイベントが既に登録されています')
-        if(errtype == -1):
-            await send_message(ctx.send, ctx.author.mention, 'エラー:イベントが見つかりません')
-        if(errtype == -2):
-            await send_message(ctx.send, ctx.author.mention, 'エラー:この動作はイベントの企画者かHOSTにのみ許可されています')
-
-    @commands.command()
-    async def plan(self, ctx, name, *detail):
-        """イベントの企画"""
-        overlapping = cmd_event.lookup_ev(name, self.event_status)
-        if (overlapping != -1):
-            await self.send_err(ctx, overlapping)
-        else:
-            txt = '\n'.join(detail)
-            embed = discord.Embed(title='[イベント告知] '+name, description=txt+'\n参加したい方はこの投稿にリアクションをつけてください。')
-            channel = bot.get_channel(int(channel_id['event']))
-            msg = await channel.send(embed=embed)
-            self.event_status.append([str(msg.id), name, txt, str(ctx.author.id)])
-            rw_csv.write_csv(EVENT_PATH, self.event_status)
-            print('plan event\nev_name:' +name+ '\nev_id:' +str(msg.id)+ '\n')
-        return
-
-    @commands.command()
-    async def cancel(self, ctx, ev_name):
-        """イベントのキャンセル"""
-        exists = cmd_event.lookup_ev(ev_name, self.event_status)
-        if (exists == -1):
-            await self.send_err(ctx, exists)
-        else:
-            target_ev = self.event_status[exists]
-            if self.have_authority(ctx.author, target_ev[3]):
-                await send_message(ctx.send, ctx.author.mention, '%sを本当に削除しますか？\n削除 -> \' y \'\n※この動作は30秒後にキャンセルされます。'%target_ev[1])
-                confirmation = await confirm(ctx.author)
-                if (confirmation):
-                    self.delete_event(exists)
-                    await del_message(int(channel_id['event']), int(target_ev[0]))
-                    print('delete event\nev_name:%s\n'%target_ev[1])
-                    await send_message(ctx.send, ctx.author.mention, target_ev[1] + 'を削除しました')
-                else:
-                    await send_message(ctx.send, ctx.author.mention, '削除をキャンセルしました')
-            else:
-                await self.send_err(ctx, -2)
-        return 
-
-    @commands.command()
-    async def start(self, ctx, ev_name):
-        """イベントの開始"""
-        exists = cmd_event.lookup_ev(ev_name, self.event_status)
-        if (exists == -1):
-            await self.send_err(ctx, exists)
-        else:
-            current_ev = self.event_status[exists]
-            print(exists)
-            print(current_ev)
-            if self.have_authority(ctx.author, current_ev[3]):
-                await send_message(ctx.send, ctx.author.mention, '参加者募集を締め切って%sを開始してもよろしいですか？\n開始 -> \' y \'\n※この動作は30秒後にキャンセルされます。'%current_ev[1])
-                confirmation = await confirm(ctx.author)
-                if (confirmation):
-                    channel = bot.get_channel(int(channel_id['event']))
-                    players = await cmd_event.get_players(int(current_ev[0]), channel)
-                    if (len(players) > 0):
-                        await send_message(channel.send, '', '%sを開始します。\n参加メンバー：\n'%current_ev[1] + '\n'.join(map(userinfo.get_mention, players)))
-                        self.delete_event(exists)
-                        print('start event\nev_name:%s\nplayers\n'%current_ev[1] + '\n'.join(map(userinfo.get_username, players)))
-                    else:
-                        await send_message(ctx.send, ctx.author.mention, '参加者がいません')
-                else:
-                    await send_message(ctx.send, ctx.author.mention, 'イベントの開始をキャンセルしました')
-            else:
-                await self.send_err(ctx, -2)
-
 class __BGM(commands.Cog, name= 'BGM管理'):
+    def search_audiofiles(self):
+        cur_path = os.getcwd()
+        os.chdir(MUSIC_PATH)    #オーディオファイルがある場所の頂点に移動
+
+        self.music_pathes = [p for p in glob('Music/**', recursive=True) if os.path.isfile(p)]              #オーディオファイルの検索（相対パス）
+        self.music_titles = [os.path.splitext(os.path.basename(path))[0] for path in self.music_pathes]     #オーディオファイルの名前から拡張子とパスを除去したリストを作成
+        self.music_pathes = [MUSIC_PATH + os.sep + p for p in self.music_pathes]                            #フルパスに変更
+        length = len(self.music_titles)
+        for i in range(length):                                                                 #トラック番号も除去
+            if (re.fullmatch(r'[0-9][0-9] .*', self.music_titles[i])):
+                self.music_titles[i] = (self.music_titles[i])[3:]
+
+        self.music_dirs = glob(os.path.join('Music', '**' + os.sep), recursive=True)                 #ディレクトリの一覧を作成（相対パス）
+        self.mdir_name  = [pathlib.Path(f).parts[-1] for f in self.music_dirs]                       #ディレクトリの一覧からパスを除去
+        os.chdir(cur_path)          #カレントディレクトリを戻す
+        return
+
     def __init__(self, bot):
         super().__init__()
         self.bot = bot
         self.mn = ''
         self.audio_status = None
+        self.search_audiofiles()
     
+    #再生キューが空の状態で放置しているとvcから切断されるため，bgm及びremoveコマンドで現在の接続状況を再読み込みする
     async def reload_state(self):
-        if (self.audio_status == None or self.audio_status.is_closed()):
+        if (self.audio_status == None or self.audio_status.is_closed()):    #vcから切断済みである場合
             global voice, now_vc
-            activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
+            activity = discord.Activity(name='Python', type=discord.ActivityType.playing)   #アクティビティも修正する
             await bot.change_presence(activity=activity)
             now_vc = None
             voice = None
         return
 
+    #embedに収まる範囲でファイル構造を送信する
+    #path：送るファイル構造の頂点のファイルパス
+    #nest：何階層分を送信するか
     async def send_tree(self, ctx, path, nest = -1):
         if (nest == 0):
             await send_message(ctx.send, '', 'エラー：該当するデータが多すぎます')
@@ -433,7 +309,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
             tree = cmd_bgm.make_filetree(path, nest = nest)
         result = await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(nest)], senderr = False)
         if (result is None):
-            await self.send_tree(ctx, path, nest = nest-1)
+            await self.send_tree(ctx, path, nest = nest-1)  #ネストを1つ浅くしてやり直し
         return
     
     @commands.command()
@@ -454,10 +330,17 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         return
 
     @commands.command()
+    async def bgminfo(self, ctx):
+        """現在再生している曲のパスを表示する"""
+        if (self.audio_status is None):
+            await send_message(ctx.send, ctx.author.mention, 'This bot is not playing an Audio File')
+        else:
+            await send_message(ctx.send, ctx.author.mention, self.audio_status.playing_info())
+        return
+
+    @commands.command()
     async def bgm(self, ctx, *bgm_or_dir_name):
         """キューを使って再生"""
-        cur_path = os.getcwd()
-        os.chdir(MUSIC_PATH)
         name = ''
         for s in bgm_or_dir_name:
             name += s + ' '
@@ -466,39 +349,27 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         await self.reload_state()
         if (ctx.author.voice is None):
             await send_message(ctx.send, ctx.author.mention, 'ボイスチャンネルが見つかりません')
-            os.chdir(cur_path)          #カレントディレクトリを戻す
             return
         
-        if ((now_vc is None) or (now_vc != ctx.author.voice.channel)):
+        if ((now_vc is None) or (now_vc != ctx.author.voice.channel)):  #vcに入っていなければ接続する
             now_vc = ctx.author.voice.channel
             voice = await bot.get_channel(now_vc.id).connect()
             self.audio_status = AudioStatus(voice)
 
-        music_pathes = [p for p in glob('Music/**', recursive=True) if os.path.isfile(p)]
-        music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
-        length = len(music_titles)
-        for i in range(length):
-            if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
-                music_titles[i] = (music_titles[i])[3:]
-
-        music_dirs = glob(os.path.join('Music', '**' + os.sep), recursive=True)
-        mdir_name  = [pathlib.Path(f).parts[-1] for f in music_dirs]
-        
-        if (len(name) == 0):
-            os.chdir(cur_path)          #カレントディレクトリを戻す
-            numbers = [i for i in range(len(music_pathes))]
+        if (len(name) == 0):            #コマンド引数無しなら全ての曲を再生キューに追加
+            numbers = [i for i in range(len(self.music_pathes))]
             random.shuffle(numbers)
             await ctx.message.delete()
             for i in numbers:
-                await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + music_pathes[i])
-        elif (name in music_titles):
-            os.chdir(cur_path)          #カレントディレクトリを戻す
-            idx = music_titles.index(name)
+                await self.audio_status.add_audio(self.music_titles[i], self.music_pathes[i])
+        elif (name in self.music_titles):    #曲名に一致した場合，該当する曲を再生キューに追加
+            idx = self.music_titles.index(name)
             await ctx.message.delete()
-            await self.audio_status.add_audio(name, MUSIC_PATH + os.sep + music_pathes[idx])
-        elif (name in mdir_name):
-            idx = mdir_name.index(name)
-            os.chdir(MUSIC_PATH + os.sep + music_dirs[idx])
+            await self.audio_status.add_audio(name, self.music_pathes[idx])
+        elif (name in self.mdir_name):       #ディレクトリ名に一致した場合，該当するディレクトリ下にある全ての曲を再生キューに追加
+            idx = self.mdir_name.index(name)
+            cur_path = os.getcwd()
+            os.chdir(MUSIC_PATH + os.sep + self.music_dirs[idx])
             music_pathes = [p for p in glob('**', recursive=True) if os.path.isfile(p)]
             music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
             os.chdir(cur_path)          #カレントディレクトリを戻す
@@ -510,10 +381,54 @@ class __BGM(commands.Cog, name= 'BGM管理'):
             random.shuffle(numbers)
             await ctx.message.delete()
             for i in numbers:
-                await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + music_dirs[idx] + os.sep + music_pathes[i])
-        else:
-            os.chdir(cur_path)          #カレントディレクトリを戻す
-            send_message(ctx.send, '', 'Audio File Not Found')
+                await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + self.music_dirs[idx] + os.sep + music_pathes[i])
+        else:                           #該当無し
+            await send_message(ctx.send, '', 'Audio File Not Found')
+        return
+
+    @commands.command()
+    async def loopbgm(self, ctx, *bgm_or_dir_name):
+        """キューを使ってループ再生"""
+        global voice, now_vc
+        await self.reload_state()
+        if (ctx.author.voice is None):
+            await send_message(ctx.send, ctx.author.mention, 'ボイスチャンネルが見つかりません')
+            return
+        
+        if ((now_vc is None) or (now_vc != ctx.author.voice.channel)):  #vcに入っていなければ接続する
+            now_vc = ctx.author.voice.channel
+            voice = await bot.get_channel(now_vc.id).connect()
+            self.audio_status = AudioStatus(voice)
+
+        for name in bgm_or_dir_name:
+            if (len(name) == 0):            #コマンド引数無しなら全ての曲を再生キューに追加
+                numbers = [i for i in range(len(self.music_pathes))]
+                random.shuffle(numbers)
+                await ctx.message.delete()
+                for i in numbers:
+                    await self.audio_status.add_audio(self.music_titles[i], self.music_pathes[i], isloop = True)
+            elif (name in self.music_titles):    #曲名に一致した場合，該当する曲を再生キューに追加
+                idx = self.music_titles.index(name)
+                await ctx.message.delete()
+                await self.audio_status.add_audio(name, self.music_pathes[idx], isloop = True)
+            elif (name in self.mdir_name):       #ディレクトリ名に一致した場合，該当するディレクトリ下にある全ての曲を再生キューに追加
+                idx = self.mdir_name.index(name)
+                cur_path = os.getcwd()
+                os.chdir(MUSIC_PATH + os.sep + self.music_dirs[idx])
+                music_pathes = [p for p in glob('**', recursive=True) if os.path.isfile(p)]
+                music_titles = [os.path.splitext(os.path.basename(path))[0] for path in music_pathes]
+                os.chdir(cur_path)          #カレントディレクトリを戻す
+                length = len(music_titles)
+                for i in range(length):
+                    if (re.fullmatch(r'[0-9][0-9] .*', music_titles[i])):
+                        music_titles[i] = (music_titles[i])[3:]
+                numbers = [i for i in range(len(music_pathes))]
+                random.shuffle(numbers)
+                await ctx.message.delete()
+                for i in numbers:
+                    await self.audio_status.add_audio(music_titles[i], MUSIC_PATH + os.sep + self.music_dirs[idx] + os.sep + music_pathes[i], isloop = True)
+            else:                           #該当無し
+                await send_message(ctx.send, '', f'{name} Not Found')
         return
 
     @commands.command()
@@ -547,32 +462,42 @@ class __BGM(commands.Cog, name= 'BGM管理'):
     @commands.command()
     async def queue(self, ctx):
         """再生キューの表示"""
-        await send_message(ctx.send, '', [x[0] for x in self.audio_status.queue], title = '再生キュー', isembed = True)
+        await send_message(ctx.send, '', [x[0] for x in self.audio_status.queue], title = '再生キュー', isembed = True, half = True)
+        return
+
+    @commands.command()
+    async def findbgm(self, ctx, filename):
+        """指定した文字列を含む音楽ファイルを返す"""
+        if (len(filename) == 0):
+            await send_message(ctx.send, ctx.author.mention, '検索ワードを指定してください')
+        else:
+            await send_message(ctx.send, ctx.author.mention, ["/".join(pathlib.Path(d).parts[-2:]) for f, d in zip(self.music_titles, self.music_pathes) if (filename in f)], half = True, title = '「' + filename + '」の検索結果', isembed = True)
+            #なぜか\\.joinにすると偶にembedがバグる
         return
 
     @commands.command()
     async def bgmlist(self, ctx, *dir_name):
         """一覧"""
         cur_path = os.getcwd()
-        os.chdir(MUSIC_PATH)
+        os.chdir(MUSIC_PATH)        #カレントディレクトリの移動
         dirname = ''
-        for s in dir_name:
+        for s in dir_name:          #引数を1つの文字列に纏める
             dirname += s + ' '
         dirname = dirname[:-1]
-        if (len(dirname) == 0):
+        if (len(dirname) == 0):     #引数無しなら全てのディレクトリを表示
             await self.send_tree(ctx=ctx, path=MUSIC_PATH+os.sep+'Music')
         else:
-            music_dirs = glob(os.path.join('Music', '**'), recursive=True)
-            for f in music_dirs:
-                if (dirname == pathlib.Path(f).parts[-1]):
+            for f in self.music_dirs:                                            
+                if (dirname == pathlib.Path(f).parts[-1]):                  #ディレクトリ名と引数が一致した場合，表示
                     current = f.split(os.sep)[1:][0]
-                    tree = cmd_bgm.make_filetree(MUSIC_PATH+os.sep+f)
-                    if (len(tree) != 1):
+                    print(dirname)
+                    tree = cmd_bgm.make_filetree(MUSIC_PATH+os.sep+f[:-1*len(os.sep)])
+                    if (len(tree) != 1):                                    #該当ディレクトリの下にディレクトリがあった場合は木構造を表示
                         result = await send_message(ctx.send, '', tree, delimiter = ['\n'+'....'*i+'├' for i in range(10)])
                         if (result is None):
                             nest = cmd_bgm.depth(tree)
                             await self.send_tree(ctx=ctx, path=MUSIC_PATH+os.sep+f, nest = nest-1)
-                    else:
+                    else:                                                   #ディレクトリを持たなければオーディオファイルの一覧を表示
                         os.chdir(MUSIC_PATH + os.sep + f)
                         music_titles = [os.path.splitext(os.path.basename(p))[0] for p in glob('*', recursive=True) if os.path.isfile(p)]
                         length = len(music_titles)
@@ -581,7 +506,7 @@ class __BGM(commands.Cog, name= 'BGM管理'):
                                 music_titles[i] = (music_titles[i])[3:]
                         await send_message(ctx.send, '', music_titles)
                     break
-        os.chdir(cur_path)
+        os.chdir(cur_path)      #カレントディレクトリを戻す
         return
     
     @commands.command()
@@ -589,20 +514,21 @@ class __BGM(commands.Cog, name= 'BGM管理'):
         """bgmの追加：infoはファイルパス"""
         cur_path = os.getcwd()
         os.chdir(MUSIC_PATH)
-        attach = ctx.message.attachments
-        if (attach and len(info) > 1):
+        attach = ctx.message.attachments    #=添付ファイル
+        if (attach and len(info) > 1):      #添付ファイルが存在するとき
             fpath = ''
-            for p in info[:-1]:
+            for p in info[:-1]:             #保存するファイルパスの作成
                 fpath += p + os.sep
-            filepath = MUSIC_PATH + os.sep + 'Music' + os.sep + fpath + info[-1] + os.path.splitext(attach[0].url)[-1]
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            result = await image_.audio_dl(attach[0].url, filepath)
+            filepath = MUSIC_PATH + os.sep + 'Music' + os.sep + fpath + info[-1] + os.path.splitext(attach[0].url)[-1]  #拡張子は元ファイル参照
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)   #ディレクトリが無ければ作成
+            result = await image_.audio_dl(attach[0].url, filepath) #添付ファイルのDL
             if (result):
                 await send_message(ctx.send, ctx.author.mention, '追加しました')
                 print(f'addbgm:{info}')
             else:
                 await send_message(ctx.send, ctx.author.mention, '失敗しました')
         os.chdir(cur_path)
+        self.search_audiofiles()
         return
 
 @bot.command()
@@ -618,7 +544,7 @@ async def bkp(ctx):
         await send_message(ctx.send, ctx.author.mention, '権限が足りません')
         return
     channel  = bot.get_channel(int(channel_id['bkp']))
-    filelist = ['Stock.txt', 'cmdsql.pickle', 'event_status.csv']
+    filelist = ['Stock.txt', 'cmdsql.pickle']
     result = await cmd_system.bkp(channel.send, filelist, MAINPATH+'/Data')
     if (result):
         mes = 'バックアップを取りました'
@@ -650,7 +576,6 @@ class __Status(commands.Cog, name = '数値確認'):
         res, result = cmd_status.st(pokedata)
         if (res == 1):
             print('status')
-            print(result)
             await send_message(ctx.send, ctx.author.mention, list(result), delimiter = ['\n', '-'], isembed = False)
         else:
             await self.send_err(ctx, res, result)
@@ -729,9 +654,27 @@ class __SQL(commands.Cog, name = 'SQL'):
         return
       
     @commands.command()
-    async def showsql(self, ctx, *cmd_SQL):
+    async def psql(self, ctx, *cmd_SQL):
         """登録済みSQL文の表示"""
         res, text = cmd_sql.showsql(cmd_SQL, SQLCMD_PATH)
+        if (res == 1):
+            await send_message(ctx.send, ctx.author.mention, text, title = '', delimiter = ['\n'])
+        elif (res == 2):
+            if (len(text) == 0):
+                text = ''
+            elif (len(text) == 1):
+                text = '\n・'+text[0][0]+'\n'+text[0][1]
+            else:
+                text[0][0] = '・' + text[0][0]
+            await send_message(ctx.send, ctx.author.mention, text, title = '', delimiter = ['\n・', '：\n    '])
+        else:
+            await self.make_err(ctx, res)
+        return
+
+    @commands.command()
+    async def psqlcmd(self, ctx, *cmd_SQL):
+        """登録済みSQLコマンドのSQL文の表示"""
+        res, text = cmd_sql.print_sql_command(cmd_SQL, SQLCMD_PATH)
         if (res == 1):
             await send_message(ctx.send, ctx.author.mention, text, title = '', delimiter = ['\n'])
         elif (res == 2):
@@ -859,7 +802,7 @@ class __Home(commands.Cog, name = 'Home'):
             return
         res, update_time = await cmd_home.pokeinfo(ctx, name[0], battlerule)
         if (len(res) <= 0):
-            await send_message(ctx.send, ctx.author.mention, 'No data('+update_time+')')
+            await send_message(ctx.send, ctx.author.mention, '\nNo data\n('+update_time+')')
             return
         print(update_time)
         await send_message(ctx.send, '', '('+update_time+')')
@@ -869,10 +812,10 @@ class __Home(commands.Cog, name = 'Home'):
 @bot.event
 async def on_message(message):
     content = message.content
+    if (len(content) == 1):
+        return
     head = content[:11].lower()
     if head == '!sql select':
-        if (message.channel.id != int(channel_id['sql']) and message.channel.guild.id != int(channel_id['myserver1']) and message.channel.guild.id != int(channel_id['myserver2'])):
-            return
         with message.channel.typing():
             res, result = cmd_sql.playsql(iter(content))
             if (res == 1):
@@ -887,7 +830,6 @@ async def on_message(message):
         return
     
     if head[:8] == '!addsql ':
-        print(content[8:])
         res, cmd = cmd_sql.addsql(content[8:].split(), SQLCMD_PATH)
         if (res == 1):
             await send_message(message.channel.send, message.author.mention, 'コマンド「'+cmd+'」が登録されました')
@@ -903,6 +845,22 @@ async def on_message(message):
                 await send_message(message.channel.send, message.author.mention, 'エラー：コマンドが見つかりません')
             if (res == -5):
                 await send_message(message.channel.send, message.author.mention, '<:9mahogyaku:766976884562198549>')
+        return
+
+    if head[:8] == '!showsql':
+        res, text = cmd_sql.showsql(content[8:].split(), SQLCMD_PATH)
+        if (res == 1):
+            await send_message(message.channel.send, message.author.mention, text, title = '', delimiter = ['\n'])
+        elif (res == 2):
+            if (len(text) == 0):
+                text = ''
+            elif (len(text) == 1):
+                text = '\n・'+text[0][0]+'\n'+text[0][1]
+            else:
+                text[0][0] = '・' + text[0][0]
+            await send_message(message.channel.send, message.author.mention, text, title = '', delimiter = ['\n・', '：\n    '])
+        else:
+            await self.make_err(message, res)
         return
     
     if(content.startswith('?')):
@@ -929,11 +887,10 @@ async def on_message(message):
 #発言の削除
 @bot.event
 async def on_raw_reaction_add(payload):
-    if (payload.emoji.name == '8jyomei'):
+    if (payload.emoji.name == 'jomei'):
         channel = bot.get_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
-        exists = cmd_event.lookup_ev2(str(payload.message_id), __Event(bot=bot).event_status)
-        if (is_me(message) and exists == -1):
+        if (is_me(message)):
             await message.delete()
             print(payload.member.name + ' has deleted bot comment')
     return
@@ -950,11 +907,10 @@ async def on_voice_state_update(member, before, after):
     vc_state += result[0]
     if (result[1] == 1 and vc_state == 1):
         print('通話開始')
-        channel = bot.get_channel(int(channel_id['call']))
-        role = bot.get_guild(int(config.get('DEFAULT', 'server'))).get_role(int(role_id['call']))
-        await channel.send(f'{role.mention} 通話が始まりました')
+        #channel = bot.get_channel(int(channel_id['call']))
+        #role = bot.get_guild(int(config.get('DEFAULT', 'server'))).get_role(int(role_id['call']))
+        #await channel.send(f'{role.mention} 通話が始まりました')
     elif ((now_vc is not None) and (len(now_vc.members) == 1) and (voice is not None)):
-        print(now_vc.members)
         await voice.disconnect()
         activity = discord.Activity(name='Python', type=discord.ActivityType.playing)
         await bot.change_presence(activity=activity)
@@ -962,11 +918,8 @@ async def on_voice_state_update(member, before, after):
         now_vc = None
     return
 
-bot.add_cog(__Roles(bot=bot))
-bot.add_cog(__Raid(bot=bot))
 bot.add_cog(__Status(bot=bot))
 bot.add_cog(__SQL(bot=bot))
 bot.add_cog(__Home(bot=bot))
-bot.add_cog(__Event(bot=bot))
 bot.add_cog(__BGM(bot=bot))
 bot.run(TOKEN)
